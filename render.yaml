@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: supplysync-backend
+    env: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SHOPIFY_STORE_URL
+        value: 8isjna-2t.myshopify.com
+      - key: SHOPIFY_ACCESS_TOKEN
+        value: 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
+      - key: SHOPIFY_API_KEY
+        value: a0e1e0bf0a757cd26f73e350341e9887
+      - key: SHOPIFY_API_SECRET
+        value: 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
+      - key: SHOPIFY_API_VERSION
+        value: "2024-01"
+      - key: GROQ_API_KEY
+        value: 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
+      - key: MARKUP_PERCENTAGE
+        value: "30"
+      - key: AUTO_PUBLISH
+        value: "false"

@@ -1,0 +1,5 @@
+node_modules/
+.env
+tracked-products.json
+token.txt
+*.log
