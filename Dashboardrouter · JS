@@ -1,0 +1,65 @@
+/**
+ * dashboardRouter.js — Dashboard & Monitoring Endpoints
+ */
+
+const express = require('express');
+const router  = express.Router();
+const db      = require('./db');
+
+// ─── GET /api/dashboard/logs ──────────────────────────────────
+router.get('/dashboard/logs', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 100;
+    const logs  = await db.getLogs(limit);
+    res.json({ status: 'success', total: logs.length, logs });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ─── GET /api/dashboard/stats ─────────────────────────────────
+router.get('/dashboard/stats', async (req, res) => {
+  try {
+    const stats = await db.getStats();
+    res.json({
+      status: 'success',
+      stats: {
+        ...stats,
+        uptime:    Math.floor(process.uptime()),
+        memory:    process.memoryUsage(),
+        dbEngine:  db.isUsingMongo() ? 'MongoDB' : 'In-Memory',
+        timestamp: new Date()
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ─── GET /api/dashboard ───────────────────────────────────────
+router.get('/dashboard', async (req, res) => {
+  try {
+    const [stats, logs] = await Promise.all([
+      db.getStats(),
+      db.getLogs(10)
+    ]);
+
+    res.json({
+      status: 'success',
+      dashboard: {
+        stats,
+        recentLogs: logs,
+        system: {
+          uptime:    Math.floor(process.uptime()) + 's',
+          memory:    `${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`,
+          dbEngine:  db.isUsingMongo() ? 'MongoDB' : 'In-Memory',
+          version:   '3.0.0'
+        }
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+module.exports = router;
