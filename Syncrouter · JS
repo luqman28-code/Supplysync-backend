@@ -1,0 +1,27 @@
+/**
+ * syncRouter.js — Sync API Endpoints
+ */
+
+const express = require('express');
+const router  = express.Router();
+const sync    = require('./sync');
+
+// POST /api/sync
+router.post('/sync', async (req, res) => {
+  const { storeUrl, markup = 0 } = req.body;
+  if (!storeUrl) return res.status(400).json({ status: 'error', message: 'storeUrl required' });
+
+  try {
+    const result = await sync.syncStore(storeUrl, { markup });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// GET /api/sync/status
+router.get('/sync/status', (req, res) => {
+  res.json({ status: 'ok', syncEnabled: !!process.env.AUTO_SYNC_INTERVAL });
+});
+
+module.exports = router;
