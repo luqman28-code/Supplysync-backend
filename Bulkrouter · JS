@@ -1,0 +1,200 @@
+/**
+ * bulkRouter.js — Bulk Import API
+ * POST /api/bulk-import
+ * POST /api/bulk-import/urls
+ */
+
+const express  = require('express');
+const router   = express.Router();
+
+const { scrapeCollection }  = require('./collection-scraper');
+const { scrapeProduct }     = require('./engine');
+const { runBulkImport }     = require('./queue');
+const db                    = require('./db');
+const { isValidUrl, toCSV } = require('./utils');
+
+// Active job tracker
+const activeJobs = new Map();
+
+// ─── POST /api/bulk-import ────────────────────────────────────
+// Input: { collectionUrl, markup, concurrency, saveToDb }
+router.post('/bulk-import', async (req, res) => {
+  const {
+    collectionUrl,
+    markup      = 0,
+    concurrency = 5,
+    maxPages    = 30,
+    saveToDb    = true
+  } = req.body;
+
+  if (!collectionUrl || !isValidUrl(collectionUrl)) {
+    return res.status(400).json({ status: 'error', message: 'Valid collectionUrl required' });
+  }
+
+  const jobId = `bulk_${Date.now()}`;
+  activeJobs.set(jobId, { status: 'running', startedAt: new Date(), progress: 0 });
+
+  // Respond immediately with jobId
+  res.json({ status: 'accepted', jobId, message: 'Bulk import started. Poll /api/bulk-import/status/:jobId' });
+
+  // Run async
+  runBulkJob(jobId, { collectionUrl, markup, concurrency, maxPages, saveToDb });
+});
+
+async function runBulkJob(jobId, opts) {
+  const { collectionUrl, markup, concurrency, maxPages, saveToDb } = opts;
+  const job = activeJobs.get(jobId);
+
+  try {
+    // Step 1: Get product URLs
+    console.log(`\n🚀 [Bulk] Job ${jobId} started: ${collectionUrl}`);
+    job.step = 'collecting_urls';
+
+    const productUrls = await scrapeCollection(collectionUrl, { maxPages });
+    job.totalUrls = productUrls.length;
+    job.step = 'scraping_products';
+
+    console.log(`📋 [Bulk] Found ${productUrls.length} product URLs`);
+
+    // Step 2: Scrape all products via queue
+    const { products, errors, stats } = await runBulkImport(
+      productUrls,
+      (url) => scrapeProduct(url, { markup }),
+      { concurrency, delay: 800 }
+    );
+
+    // Step 3: Save to DB
+    if (saveToDb && products.length > 0) {
+      job.step = 'saving';
+      await db.saveMany(products);
+      await db.saveLog({
+        type:     'bulk-import',
+        jobId,
+        source:   collectionUrl,
+        total:    products.length,
+        failed:   errors.length,
+        status:   'completed'
+      });
+    }
+
+    job.status    = 'completed';
+    job.products  = products;
+    job.errors    = errors;
+    job.stats     = stats;
+    job.completedAt = new Date();
+
+    console.log(`✅ [Bulk] Job ${jobId} complete — ${products.length} products`);
+  } catch (err) {
+    job.status    = 'failed';
+    job.error     = err.message;
+    job.completedAt = new Date();
+    console.error(`❌ [Bulk] Job ${jobId} failed:`, err.message);
+  }
+}
+
+// ─── POST /api/bulk-import/urls ───────────────────────────────
+// Direct URL list (skip collection scraping)
+router.post('/bulk-import/urls', async (req, res) => {
+  const { urls = [], markup = 0, concurrency = 5, saveToDb = true } = req.body;
+
+  if (!Array.isArray(urls) || urls.length === 0) {
+    return res.status(400).json({ status: 'error', message: 'urls array required' });
+  }
+
+  const validUrls = urls.filter(u => isValidUrl(u));
+  if (validUrls.length === 0) {
+    return res.status(400).json({ status: 'error', message: 'No valid URLs provided' });
+  }
+
+  try {
+    const { products, errors, stats } = await runBulkImport(
+      validUrls,
+      (url) => scrapeProduct(url, { markup }),
+      { concurrency }
+    );
+
+    if (saveToDb && products.length > 0) {
+      await db.saveMany(products);
+    }
+
+    res.json({
+      status:        'success',
+      totalRequested: validUrls.length,
+      totalProducts:  products.length,
+      totalFailed:    errors.length,
+      stats,
+      products,
+      errors
+    });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ─── GET /api/bulk-import/status/:jobId ──────────────────────
+router.get('/bulk-import/status/:jobId', (req, res) => {
+  const job = activeJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ status: 'error', message: 'Job not found' });
+
+  const response = {
+    jobId:     req.params.jobId,
+    status:    job.status,
+    step:      job.step,
+    startedAt: job.startedAt,
+    totalUrls: job.totalUrls || 0,
+    stats:     job.stats
+  };
+
+  if (job.status === 'completed') {
+    response.completedAt  = job.completedAt;
+    response.totalProducts = job.products?.length || 0;
+    response.totalFailed   = job.errors?.length   || 0;
+    response.products      = job.products || [];
+    response.errors        = job.errors   || [];
+  }
+
+  if (job.status === 'failed') {
+    response.error       = job.error;
+    response.completedAt = job.completedAt;
+  }
+
+  res.json(response);
+});
+
+// ─── GET /api/bulk-import/export/:jobId ──────────────────────
+router.get('/bulk-import/export/:jobId', (req, res) => {
+  const job = activeJobs.get(req.params.jobId);
+  if (!job || job.status !== 'completed') {
+    return res.status(404).json({ status: 'error', message: 'Job not found or not completed' });
+  }
+
+  const csv = toCSV(job.products || []);
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', `attachment; filename="products_${req.params.jobId}.csv"`);
+  res.send(csv);
+});
+
+// ─── GET /api/products ────────────────────────────────────────
+router.get('/products', async (req, res) => {
+  try {
+    const products = await db.getProducts(req.query);
+    res.json({ status: 'success', total: products.length, products });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ─── GET /api/products/export ─────────────────────────────────
+router.get('/products/export', async (req, res) => {
+  try {
+    const products = await db.getProducts();
+    const csv = toCSV(products);
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="all_products.csv"');
+    res.send(csv);
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+module.exports = router;
