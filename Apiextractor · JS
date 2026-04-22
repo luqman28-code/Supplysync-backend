@@ -1,0 +1,262 @@
+/**
+ * apiExtractor.js — Layer 1: Direct API Extraction
+ * Supports: Shopify, WooCommerce, Magento, BigCommerce
+ */
+
+const axios = require('axios');
+const { getHeaders, sleep } = require('./utils');
+
+/**
+ * Main extractor — detects platform and routes to correct API
+ */
+async function extract(url, platform) {
+  const base = getBaseUrl(url);
+
+  switch (platform) {
+    case 'shopify':     return await extractShopify(url, base);
+    case 'woocommerce': return await extractWooCommerce(url, base);
+    case 'magento':     return await extractMagento(url, base);
+    case 'bigcommerce': return await extractBigCommerce(url, base);
+    default:            return await tryAllAPIs(url, base);
+  }
+}
+
+function getBaseUrl(url) {
+  try {
+    const u = new URL(url);
+    return `${u.protocol}//${u.hostname}`;
+  } catch {
+    return url;
+  }
+}
+
+// ─── SHOPIFY ──────────────────────────────────────────────────
+async function extractShopify(url, base) {
+  // Convert product URL to .json
+  const handle = extractShopifyHandle(url);
+  const jsonUrl = handle
+    ? `${base}/products/${handle}.json`
+    : url.replace(/\.html.*$/, '').replace(/\?.*$/, '') + '.json';
+
+  const res = await axios.get(jsonUrl, {
+    headers: getHeaders(),
+    timeout: 15000
+  });
+
+  const p = res.data?.product;
+  if (!p) throw new Error('No product in Shopify API response');
+
+  return {
+    title:            p.title,
+    description:      p.body_html,
+    vendor:           p.vendor,
+    product_type:     p.product_type,
+    tags:             p.tags,
+    price:            p.variants?.[0]?.price,
+    compare_at_price: p.variants?.[0]?.compare_at_price,
+    sku:              p.variants?.[0]?.sku,
+    images:           (p.images || []).map(img => img.src),
+    variants:         (p.variants || []).map(v => ({
+      title:            v.title,
+      price:            v.price,
+      compare_at_price: v.compare_at_price,
+      sku:              v.sku,
+      inventory:        v.inventory_quantity,
+      option1:          v.option1,
+      option2:          v.option2,
+      option3:          v.option3
+    })),
+    options: p.options,
+    _platform: 'shopify'
+  };
+}
+
+function extractShopifyHandle(url) {
+  const match = url.match(/\/products\/([^\/\?#]+)/);
+  return match ? match[1] : null;
+}
+
+// ─── WOOCOMMERCE ──────────────────────────────────────────────
+async function extractWooCommerce(url, base) {
+  // Try REST API
+  const slug = extractSlug(url);
+
+  // Try public endpoint first (no auth needed for published products)
+  const apiUrl = `${base}/wp-json/wc/v3/products?slug=${slug}&per_page=1`;
+
+  try {
+    const res = await axios.get(apiUrl, {
+      headers: getHeaders(),
+      timeout: 15000,
+      auth: process.env.WOO_KEY && process.env.WOO_SECRET
+        ? { username: process.env.WOO_KEY, password: process.env.WOO_SECRET }
+        : undefined
+    });
+
+    const p = res.data?.[0];
+    if (!p) throw new Error('Product not found in WooCommerce');
+
+    return {
+      title:            p.name,
+      description:      p.description,
+      price:            p.price,
+      compare_at_price: p.regular_price,
+      sku:              p.sku,
+      images:           (p.images || []).map(img => img.src),
+      variants:         (p.variations || []).map(v => ({
+        id: v
+      })),
+      _platform: 'woocommerce'
+    };
+  } catch (e) {
+    // Try WordPress REST as fallback
+    return await extractWooWordPress(url, base, slug);
+  }
+}
+
+async function extractWooWordPress(url, base, slug) {
+  const wpUrl = `${base}/wp-json/wp/v2/posts?slug=${slug}`;
+  const res = await axios.get(wpUrl, { headers: getHeaders(), timeout: 10000 });
+  const p = res.data?.[0];
+  if (!p) throw new Error('WooCommerce WP fallback failed');
+  return {
+    title:       p.title?.rendered,
+    description: p.content?.rendered,
+    price:       null,
+    images:      [],
+    _platform:   'woocommerce-wp'
+  };
+}
+
+// ─── MAGENTO ──────────────────────────────────────────────────
+async function extractMagento(url, base) {
+  const sku = extractMagentoSku(url);
+  const apiUrl = `${base}/rest/V1/products/${sku}`;
+
+  const res = await axios.get(apiUrl, {
+    headers: {
+      ...getHeaders(),
+      Authorization: process.env.MAGENTO_TOKEN ? `Bearer ${process.env.MAGENTO_TOKEN}` : undefined
+    },
+    timeout: 15000
+  });
+
+  const p = res.data;
+  if (!p?.sku) throw new Error('No product in Magento response');
+
+  const priceAttr = p.custom_attributes?.find(a => a.attribute_code === 'price');
+  const imgAttr   = p.media_gallery_entries || [];
+
+  return {
+    title:       p.name,
+    description: p.custom_attributes?.find(a => a.attribute_code === 'description')?.value,
+    price:       p.price,
+    sku:         p.sku,
+    images:      imgAttr.map(img => `${base}/pub/media/catalog/product${img.file}`),
+    variants:    [],
+    _platform:   'magento'
+  };
+}
+
+function extractMagentoSku(url) {
+  const parts = url.split('/');
+  return parts[parts.length - 1].split('.')[0];
+}
+
+// ─── BIGCOMMERCE ─────────────────────────────────────────────
+async function extractBigCommerce(url, base) {
+  // Try GraphQL storefront API
+  const graphqlUrl = `${base}/graphql`;
+  const handle = extractSlug(url);
+
+  const query = `
+    query {
+      site {
+        route(path: "/${handle}") {
+          node {
+            ... on Product {
+              name
+              description
+              defaultImage { url(width: 1200) }
+              images { edges { node { url(width: 1200) } } }
+              prices {
+                price { value currencyCode }
+                basePrice { value }
+              }
+              variants { edges { node {
+                sku
+                prices { price { value } }
+                productOptions { edges { node { displayName values { edges { node { label } } } } } }
+              }}}
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const res = await axios.post(graphqlUrl, { query }, {
+    headers: {
+      ...getHeaders(),
+      'Content-Type': 'application/json'
+    },
+    timeout: 15000
+  });
+
+  const p = res.data?.data?.site?.route?.node;
+  if (!p?.name) throw new Error('BigCommerce GraphQL failed');
+
+  return {
+    title:       p.name,
+    description: p.description,
+    price:       p.prices?.price?.value,
+    images:      [p.defaultImage?.url, ...(p.images?.edges?.map(e => e.node.url) || [])].filter(Boolean),
+    variants:    p.variants?.edges?.map(e => ({
+      sku:   e.node.sku,
+      price: e.node.prices?.price?.value
+    })),
+    _platform: 'bigcommerce'
+  };
+}
+
+// ─── FALLBACK: Try all known API patterns ────────────────────
+async function tryAllAPIs(url, base) {
+  const handle = extractSlug(url);
+  const attempts = [
+    `${base}/products/${handle}.json`,
+    `${base}/wp-json/wc/v3/products?slug=${handle}`,
+    `${url.split('?')[0]}.json`,
+  ];
+
+  for (const attempt of attempts) {
+    try {
+      const res = await axios.get(attempt, { headers: getHeaders(), timeout: 8000 });
+      if (res.data && (res.data.product || res.data[0])) {
+        const p = res.data.product || res.data[0];
+        return {
+          title:       p.title || p.name,
+          description: p.body_html || p.description,
+          price:       p.variants?.[0]?.price || p.price,
+          images:      (p.images || []).map(img => img.src || img),
+          variants:    [],
+          _platform:   'auto-detected'
+        };
+      }
+    } catch { /* continue */ }
+    await sleep(500);
+  }
+
+  throw new Error('No API endpoint responded successfully');
+}
+
+function extractSlug(url) {
+  try {
+    const u = new URL(url);
+    const parts = u.pathname.split('/').filter(Boolean);
+    return parts[parts.length - 1].split('.')[0];
+  } catch {
+    return '';
+  }
+}
+
+module.exports = { extract };
