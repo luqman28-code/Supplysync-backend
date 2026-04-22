@@ -2,11 +2,16 @@ services:
   - type: web
     name: supplysync-backend
     env: node
+    region: oregon
+    plan: free
     buildCommand: npm install
     startCommand: node server.js
+    healthCheckPath: /health
     envVars:
       - key: NODE_ENV
         value: production
+
+      # ── SHOPIFY ──────────────────────────────────────
       - key: SHOPIFY_STORE_URL
         value: 8isjna-2t.myshopify.com
       - key: SHOPIFY_ACCESS_TOKEN
@@ -17,9 +22,17 @@ services:
         value: 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
       - key: SHOPIFY_API_VERSION
         value: "2024-01"
+
+      # ── AI (Groq) ────────────────────────────────────
       - key: GROQ_API_KEY
         value: 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
+
+      # ── IMPORT DEFAULTS ──────────────────────────────
       - key: MARKUP_PERCENTAGE
         value: "30"
       - key: AUTO_PUBLISH
         value: "false"
+
+      # ── SERVER ───────────────────────────────────────
+      - key: PORT
+        value: "3001"
