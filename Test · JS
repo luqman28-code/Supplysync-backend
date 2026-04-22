@@ -1,0 +1,50 @@
+/**
+ * test.js — Quick API Test Script
+ * Run: node test.js
+ */
+
+const axios = require('axios');
+const BASE  = process.env.BASE_URL || 'http://localhost:3000';
+
+async function test(name, fn) {
+  process.stdout.write(`Testing: ${name}... `);
+  try {
+    await fn();
+    console.log('✅ PASS');
+  } catch (e) {
+    console.log(`❌ FAIL — ${e.response?.data?.message || e.message}`);
+  }
+}
+
+(async () => {
+  console.log(`\n🧪 SupplySync API Tests — ${BASE}\n`);
+
+  // Health check
+  await test('Health Check', async () => {
+    const r = await axios.get(`${BASE}/api/health`);
+    if (r.data.status !== 'ok') throw new Error('Health check failed');
+  });
+
+  // Scrape single Shopify product
+  await test('Scrape Shopify Product (finnmarksauna.com)', async () => {
+    const r = await axios.post(`${BASE}/api/scrape`, {
+      url: 'https://finnmarksauna.com/collections/indoor-saunas'
+    });
+    console.log(`\n   Platform: ${r.data.product?._meta?.platform}`);
+    console.log(`   Title: ${r.data.product?.title?.slice(0, 50)}`);
+  });
+
+  // Dashboard stats
+  await test('Dashboard Stats', async () => {
+    const r = await axios.get(`${BASE}/api/dashboard/stats`);
+    if (!r.data.stats) throw new Error('No stats returned');
+  });
+
+  // DB Stats
+  await test('Dashboard', async () => {
+    const r = await axios.get(`${BASE}/api/dashboard`);
+    if (!r.data.dashboard) throw new Error('No dashboard data');
+  });
+
+  console.log('\n✅ All tests complete!\n');
+})();
