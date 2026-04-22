@@ -1,0 +1,114 @@
+/**
+ * shopifyRouter.js — Shopify API Endpoints
+ */
+
+const express  = require('express');
+const router   = express.Router();
+const shopify  = require('./shopify');
+const { scrapeProduct }  = require('./engine');
+const { scrapeCollection } = require('./collection-scraper');
+const { runBulkImport }  = require('./queue');
+const { isValidUrl }     = require('./utils');
+
+// ─── GET /api/shopify/test ────────────────────────────────────
+router.get('/shopify/test', async (req, res) => {
+  try {
+    const store = await shopify.getStoreInfo();
+    res.json({ status: 'connected', store: { name: store.name, domain: store.domain, plan: store.plan_name } });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ─── POST /api/shopify/upload ─────────────────────────────────
+// Upload a single scraped product URL to Shopify
+router.post('/shopify/upload', async (req, res) => {
+  const { url, markup = 0, vendor, autoPublish = false, extraTags = [] } = req.body;
+
+  if (!url || !isValidUrl(url)) {
+    return res.status(400).json({ status: 'error', message: 'Valid URL required' });
+  }
+
+  try {
+    // 1. Scrape product
+    const scraped = await scrapeProduct(url, { markup });
+    if (scraped.status === 'error') return res.status(422).json(scraped);
+
+    // 2. Upload to Shopify
+    const result = await shopify.uploadProduct(scraped.product, { markup, vendor, autoPublish, extraTags });
+
+    res.json({
+      status:     'success',
+      shopifyId:  result.shopifyId,
+      handle:     result.handle,
+      product:    scraped.product
+    });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ─── POST /api/shopify/bulk-upload ────────────────────────────
+// Scrape entire collection and upload all to Shopify
+router.post('/shopify/bulk-upload', async (req, res) => {
+  const {
+    collectionUrl,
+    markup      = 0,
+    concurrency = 3,
+    maxPages    = 20,
+    vendor,
+    autoPublish = false
+  } = req.body;
+
+  if (!collectionUrl || !isValidUrl(collectionUrl)) {
+    return res.status(400).json({ status: 'error', message: 'Valid collectionUrl required' });
+  }
+
+  const jobId = `shopify_bulk_${Date.now()}`;
+  res.json({ status: 'accepted', jobId, message: 'Bulk Shopify upload started' });
+
+  // Run async
+  (async () => {
+    try {
+      console.log(`\n🛍️  [Shopify Bulk] Starting: ${collectionUrl}`);
+
+      const urls = await scrapeCollection(collectionUrl, { maxPages });
+      console.log(`📋 Found ${urls.length} products to upload`);
+
+      const { products, errors } = await runBulkImport(
+        urls,
+        (url) => scrapeProduct(url, { markup }),
+        { concurrency, delay: 1000 }
+      );
+
+      const uploadResults = await shopify.uploadMany(products, { markup, vendor, autoPublish });
+
+      console.log(`✅ [Shopify Bulk] Done — Uploaded: ${uploadResults.uploaded}, Failed: ${uploadResults.failed}`);
+    } catch (err) {
+      console.error('❌ [Shopify Bulk] Error:', err.message);
+    }
+  })();
+});
+
+// ─── GET /api/shopify/products ────────────────────────────────
+router.get('/shopify/products', async (req, res) => {
+  try {
+    const limit    = parseInt(req.query.limit) || 50;
+    const products = await shopify.getShopifyProducts(limit);
+    res.json({ status: 'success', total: products.length, products });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ─── DELETE /api/shopify/products/:id ────────────────────────
+router.delete('/shopify/products/:id', async (req, res) => {
+  try {
+    const result = await shopify.deleteShopifyProduct(req.params.id);
+    res.json({ status: 'success', ...result });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+module.exports = router;
