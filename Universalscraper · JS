@@ -1,0 +1,741 @@
+/**
+ * universalScraper.js — Universal Product Scraper
+ * Supports: Shopify, WooCommerce, Magento, BigCommerce, Wix, Squarespace, Custom
+ * Auto-detects platform and uses the BEST extraction method
+ */
+
+const axios            = require('axios');
+const cheerio          = require('cheerio');
+const { detectPlatform } = require('./platformDetector');
+const { extractImages, makeAbsolute } = require('./imageExtractor');
+const { getHeaders, sleep }           = require('./utils');
+
+/**
+ * MAIN ENTRY POINT
+ * @param {string} url - Any product page URL
+ * @returns {object} Normalized product data
+ */
+async function scrapeUniversal(url) {
+  const platform = await detectPlatform(url);
+  console.log(`🔍 [Universal] ${url.slice(0, 60)} → Platform: ${platform}`);
+
+  let result = null;
+
+  try {
+    switch (platform) {
+      case 'shopify':     result = await scrapeShopify(url);     break;
+      case 'woocommerce': result = await scrapeWooCommerce(url); break;
+      case 'magento':     result = await scrapeMagento(url);     break;
+      case 'bigcommerce': result = await scrapeBigCommerce(url); break;
+      case 'wix':         result = await scrapeWix(url);         break;
+      case 'squarespace': result = await scrapeSquarespace(url); break;
+      default:            result = await scrapeCustom(url);      break;
+    }
+  } catch (err) {
+    console.log(`  ⚠️ [${platform}] Primary failed: ${err.message} → Trying fallback`);
+    result = await scrapeFallback(url);
+  }
+
+  if (!result || !result.title) {
+    result = await scrapeFallback(url);
+  }
+
+  return normalize(result, url, platform);
+}
+
+// ═══════════════════════════════════════════════════════════
+// 1. SHOPIFY — JSON API (fastest, most reliable)
+// ═══════════════════════════════════════════════════════════
+async function scrapeShopify(url) {
+  const base   = getBase(url);
+  const handle = url.match(/\/products\/([^\/\?#]+)/)?.[1];
+
+  // Try product JSON
+  const jsonUrl = handle
+    ? `${base}/products/${handle}.json`
+    : url.replace(/\?.*/, '') + '.json';
+
+  const res = await axios.get(jsonUrl, { headers: getHeaders(), timeout: 15000 });
+  const p   = res.data?.product;
+  if (!p?.title) throw new Error('No product in Shopify JSON');
+
+  // Get ALL images including variant images
+  const allImages = [];
+  (p.images || []).forEach(img => {
+    if (img.src) allImages.push(img.src);
+  });
+
+  return {
+    title:            p.title,
+    price:            p.variants?.[0]?.price,
+    compare_at_price: p.variants?.[0]?.compare_at_price,
+    description:      p.body_html,
+    images:           allImages,
+    image:            allImages[0] || null,
+    sku:              p.variants?.[0]?.sku,
+    vendor:           p.vendor,
+    product_type:     p.product_type,
+    variants:         (p.variants || []).map(v => ({
+      title:            v.title,
+      price:            v.price,
+      compare_at_price: v.compare_at_price,
+      sku:              v.sku,
+      option1:          v.option1,
+      option2:          v.option2
+    })),
+    _platform: 'shopify'
+  };
+}
+
+// ═══════════════════════════════════════════════════════════
+// 2. WOOCOMMERCE — REST API then HTML fallback
+// ═══════════════════════════════════════════════════════════
+async function scrapeWooCommerce(url) {
+  const base = getBase(url);
+  const slug = getSlug(url);
+
+  // Try WooCommerce REST API
+  try {
+    const apiUrl = `${base}/wp-json/wc/v3/products?slug=${slug}&per_page=1`;
+    const res    = await axios.get(apiUrl, { headers: getHeaders(), timeout: 12000 });
+    const p      = res.data?.[0];
+
+    if (p?.name) {
+      const images = (p.images || []).map(i => i.src).filter(Boolean);
+      return {
+        title:            p.name,
+        price:            p.price,
+        compare_at_price: p.regular_price,
+        description:      p.description || p.short_description,
+        images,
+        image:            images[0] || null,
+        sku:              p.sku,
+        _platform:        'woocommerce-api'
+      };
+    }
+  } catch {}
+
+  // Fallback: HTML scraping
+  return await scrapeWooHTML(url, base);
+}
+
+async function scrapeWooHTML(url, base) {
+  const res = await axios.get(url, { headers: getHeaders(), timeout: 18000 });
+  const $   = cheerio.load(res.data);
+  const images = extractImages($, base);
+
+  // Try high-res from gallery data attribute
+  const galleryImages = [];
+  $('[data-large_image], .woocommerce-product-gallery__image').each((_, el) => {
+    const hi = $(el).attr('data-large_image') || $(el).find('img').attr('data-large_image');
+    if (hi) galleryImages.push(makeAbsolute(hi, base));
+  });
+
+  const allImages = [...new Set([...galleryImages, ...images])].filter(Boolean);
+
+  return {
+    title:            $('h1.product_title, h1.entry-title').first().text().trim(),
+    price:            $('.woocommerce-Price-amount bdi').first().text().trim(),
+    compare_at_price: $('.price del .woocommerce-Price-amount bdi').text().trim(),
+    description:      $('#tab-description, .woocommerce-product-details__short-description').html() || '',
+    sku:              $('.sku').text().trim(),
+    images:           allImages,
+    image:            allImages[0] || null,
+    _platform:        'woocommerce-html'
+  };
+}
+
+// ═══════════════════════════════════════════════════════════
+// 3. MAGENTO — REST API then Playwright fallback
+// ═══════════════════════════════════════════════════════════
+async function scrapeMagento(url) {
+  const base = getBase(url);
+
+  // Try Magento REST API
+  try {
+    const sku    = getSlug(url);
+    const apiUrl = `${base}/rest/V1/products/${encodeURIComponent(sku)}`;
+    const res    = await axios.get(apiUrl, {
+      headers: {
+        ...getHeaders(),
+        Authorization: process.env.MAGENTO_TOKEN ? `Bearer ${process.env.MAGENTO_TOKEN}` : undefined
+      },
+      timeout: 12000
+    });
+    const p = res.data;
+    if (p?.name) {
+      const mediaBase = `${base}/pub/media/catalog/product`;
+      const images    = (p.media_gallery_entries || []).map(e => `${mediaBase}${e.file}`);
+      return {
+        title:       p.name,
+        price:       p.price,
+        description: p.custom_attributes?.find(a => a.attribute_code === 'description')?.value,
+        sku:         p.sku,
+        images,
+        image:       images[0] || null,
+        _platform:   'magento-api'
+      };
+    }
+  } catch {}
+
+  // Fallback: HTML
+  return await scrapeHTMLGeneric(url, 'magento');
+}
+
+// ═══════════════════════════════════════════════════════════
+// 4. BIGCOMMERCE — GraphQL Storefront API
+// ═══════════════════════════════════════════════════════════
+async function scrapeBigCommerce(url) {
+  const base   = getBase(url);
+  const handle = getSlug(url);
+
+  // Try GraphQL
+  try {
+    const query = `query {
+      site {
+        route(path: "/${handle}") {
+          node {
+            ... on Product {
+              name
+              description
+              defaultImage { url(width: 1200) }
+              images { edges { node { url(width: 1200) isDefault } } }
+              prices {
+                price { value currencyCode }
+                basePrice { value }
+              }
+              sku
+              variants { edges { node {
+                sku
+                prices { price { value } }
+              }}}
+            }
+          }
+        }
+      }
+    }`;
+
+    const res = await axios.post(`${base}/graphql`, { query }, {
+      headers: { ...getHeaders(), 'Content-Type': 'application/json' },
+      timeout: 15000
+    });
+
+    const p = res.data?.data?.site?.route?.node;
+    if (p?.name) {
+      const images = p.images?.edges?.map(e => e.node.url).filter(Boolean) || [];
+      if (p.defaultImage?.url) images.unshift(p.defaultImage.url);
+      return {
+        title:       p.name,
+        price:       p.prices?.price?.value,
+        description: p.description,
+        sku:         p.sku,
+        images:      [...new Set(images)],
+        image:       images[0] || null,
+        _platform:   'bigcommerce-graphql'
+      };
+    }
+  } catch {}
+
+  return await scrapeHTMLGeneric(url, 'bigcommerce');
+}
+
+// ═══════════════════════════════════════════════════════════
+// 5. WIX — Playwright (JS rendering required)
+// ═══════════════════════════════════════════════════════════
+async function scrapeWix(url) {
+  // Wix requires JS rendering — use Playwright
+  return await scrapeWithPlaywright(url, {
+    waitFor:   '[data-hook="product-title"], .product-name, h1',
+    platform:  'wix',
+    extraJs:   `
+      // Wix stores product data in window
+      const store = window.__WARMUP_DATA__ || window.__INITIAL_STATE__ || {};
+      const product = store?.product || store?.catalog?.product || null;
+      return product ? JSON.stringify(product) : null;
+    `
+  });
+}
+
+// ═══════════════════════════════════════════════════════════
+// 6. SQUARESPACE — HTML + JSON-LD
+// ═══════════════════════════════════════════════════════════
+async function scrapeSquarespace(url) {
+  const res = await axios.get(url, { headers: getHeaders(), timeout: 18000 });
+  const $   = cheerio.load(res.data);
+  const base = getBase(url);
+
+  // Squarespace JSON endpoint
+  try {
+    const jsonUrl = url.replace(/\?.*/, '') + '?format=json';
+    const jRes    = await axios.get(jsonUrl, { headers: getHeaders(), timeout: 10000 });
+    const data    = jRes.data;
+    const item    = data?.item || data?.product || data;
+
+    if (item?.title) {
+      const images = [];
+      if (item.assetUrl) images.push(item.assetUrl);
+      (item.items || []).forEach(i => { if (i.assetUrl) images.push(i.assetUrl); });
+
+      return {
+        title:       item.title,
+        price:       item.variants?.[0]?.priceMoney?.value || item.price,
+        description: item.body || item.excerpt,
+        images,
+        image:       images[0] || null,
+        _platform:   'squarespace-json'
+      };
+    }
+  } catch {}
+
+  // HTML fallback
+  const images = extractImages($, base);
+  return {
+    title:       $('h1.ProductItem-details-title, h1[data-compound-type="title"], h1').first().text().trim(),
+    price:       $('.product-price, [data-test="product-price"]').first().text().trim(),
+    description: $('.ProductItem-details-excerpt, .product-description').html() || '',
+    images,
+    image:       images[0] || null,
+    _platform:   'squarespace-html'
+  };
+}
+
+// ═══════════════════════════════════════════════════════════
+// 7. CUSTOM SITES — Multi-strategy HTML extraction
+// ═══════════════════════════════════════════════════════════
+async function scrapeCustom(url) {
+  const base = getBase(url);
+
+  // First try: axios + cheerio (fast)
+  try {
+    const res = await axios.get(url, {
+      headers:      getHeaders(),
+      timeout:      20000,
+      maxRedirects: 5
+    });
+    const $ = cheerio.load(res.data);
+
+    // Strategy 1: JSON-LD
+    const ldResult = extractFromLdJson($, base);
+    if (ldResult?.title && ldResult?.image) return ldResult;
+
+    // Strategy 2: window objects
+    const windowResult = extractFromWindowObjects(res.data, $, base);
+    if (windowResult?.title) return windowResult;
+
+    // Strategy 3: Next.js / Nuxt data
+    const nextResult = extractFromNextData($, base);
+    if (nextResult?.title) return nextResult;
+
+    // Strategy 4: Meta tags + HTML
+    const htmlResult = scrapeHTMLProduct($, base, url);
+    if (htmlResult?.title) return htmlResult;
+
+  } catch (e) {
+    console.log(`  [Custom] Axios failed: ${e.message} → Playwright`);
+  }
+
+  // Last resort: Playwright
+  return await scrapeWithPlaywright(url, { platform: 'custom' });
+}
+
+// ═══════════════════════════════════════════════════════════
+// SHARED HTML STRATEGIES
+// ═══════════════════════════════════════════════════════════
+
+function extractFromLdJson($, base) {
+  let found = null;
+  $('script[type="application/ld+json"]').each((_, el) => {
+    if (found) return;
+    try {
+      const json    = JSON.parse($(el).html());
+      const schemas = Array.isArray(json) ? json : [json];
+      schemas.forEach(s => {
+        const p = s['@type'] === 'Product' ? s :
+                  s['@graph']?.find(g => g['@type'] === 'Product');
+        if (p && !found) {
+          const offer  = (Array.isArray(p.offers) ? p.offers[0] : p.offers) || {};
+          const images = flattenImages(p.image, base);
+          found = {
+            title:       p.name,
+            price:       offer.price,
+            description: p.description,
+            sku:         p.sku || offer.sku,
+            brand:       p.brand?.name,
+            images,
+            image:       images[0] || null,
+            _platform:   'ld-json'
+          };
+        }
+      });
+    } catch {}
+  });
+  return found;
+}
+
+function extractFromWindowObjects(html, $, base) {
+  const patterns = [
+    /window\.product\s*=\s*({[\s\S]+?});/,
+    /window\.__product__\s*=\s*({[\s\S]+?});/,
+    /var\s+product\s*=\s*({[\s\S]+?});/,
+    /"product"\s*:\s*({[\s\S]+?})\s*[,}]/,
+    /ProductData\s*=\s*({[\s\S]+?});/,
+    /window\.productVariants\s*=\s*(\[[\s\S]+?\]);/,
+  ];
+
+  for (const pattern of patterns) {
+    try {
+      const match = html.match(pattern);
+      if (!match) continue;
+      const p = JSON.parse(match[1]);
+      if (p?.title || p?.name) {
+        const imgs = extractImagesFromObject(p, base);
+        return {
+          title:       p.title || p.name,
+          price:       p.price || p.variants?.[0]?.price,
+          description: p.description || p.body_html,
+          sku:         p.sku,
+          images:      imgs,
+          image:       imgs[0] || null,
+          _platform:   'window-object'
+        };
+      }
+    } catch {}
+  }
+  return null;
+}
+
+function extractFromNextData($, base) {
+  try {
+    const raw  = $('#__NEXT_DATA__').html();
+    if (!raw) return null;
+    const json  = JSON.parse(raw);
+    const props = json?.props?.pageProps;
+
+    const p = props?.product ||
+              props?.data?.product ||
+              props?.initialProps?.product ||
+              props?.pageData?.product ||
+              findProductInObject(props);
+
+    if (!p?.title && !p?.name) return null;
+
+    const imgs = extractImagesFromObject(p, base);
+    return {
+      title:       p.title || p.name,
+      price:       p.price || p.variants?.[0]?.price || p.priceRange?.min,
+      description: p.description || p.body_html,
+      sku:         p.sku,
+      images:      imgs,
+      image:       imgs[0] || null,
+      _platform:   'next-data'
+    };
+  } catch {
+    return null;
+  }
+}
+
+function scrapeHTMLProduct($, base, url) {
+  const images = extractImages($, base);
+
+  // Title — try multiple selectors
+  const title =
+    $('h1[class*="product"], h1[class*="title"], h1[itemprop="name"]').first().text().trim() ||
+    $('h1').first().text().trim() ||
+    $('meta[property="og:title"]').attr('content') || '';
+
+  // Price — multiple patterns
+  const price =
+    $('[class*="sale-price"], [class*="saleprice"]').first().text().trim() ||
+    $('[itemprop="price"]').attr('content') ||
+    $('[itemprop="price"]').first().text().trim() ||
+    $('[class*="product-price"], [class*="productprice"]').first().text().trim() ||
+    $('[class*="price"]:not([class*="compare"]):not([class*="was"]):not([class*="old"])').first().text().trim() ||
+    $('meta[property="product:price:amount"]').attr('content') || '';
+
+  const comparePrice =
+    $('[class*="compare"], [class*="was-price"], del [class*="price"]').first().text().trim() || '';
+
+  const description =
+    $('[class*="product-description"], [class*="productdescription"], [itemprop="description"]').html() ||
+    $('[class*="description"]').first().html() ||
+    $('meta[property="og:description"]').attr('content') || '';
+
+  const sku =
+    $('[class*="sku"], [itemprop="sku"]').text().trim().replace(/SKU:?\s*/i, '') || '';
+
+  return {
+    title,
+    price,
+    compare_at_price: comparePrice,
+    description,
+    sku,
+    images,
+    image:     images[0] || null,
+    _platform: 'custom-html'
+  };
+}
+
+// ═══════════════════════════════════════════════════════════
+// PLAYWRIGHT FALLBACK (for JS-heavy sites)
+// ═══════════════════════════════════════════════════════════
+async function scrapeWithPlaywright(url, options = {}) {
+  let pw, browser;
+  try {
+    pw = require('playwright');
+  } catch {
+    throw new Error('Playwright not installed. Run: npm install playwright && npx playwright install chromium');
+  }
+
+  try {
+    browser = await pw.chromium.launch({
+      headless: true,
+      args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-blink-features=AutomationControlled']
+    });
+
+    const ctx = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      viewport:  { width: 1366, height: 768 }
+    });
+
+    await ctx.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      window.chrome = { runtime: {} };
+    });
+
+    const page = await ctx.newPage();
+
+    // Intercept JSON responses
+    const apiData = [];
+    page.on('response', async (res) => {
+      try {
+        const ct = res.headers()['content-type'] || '';
+        if (ct.includes('json')) {
+          const json = await res.json().catch(() => null);
+          if (json && (json.title || json.name || json.product)) apiData.push(json);
+        }
+      } catch {}
+    });
+
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 35000 });
+
+    // Wait for content
+    try {
+      await page.waitForSelector(options.waitFor || 'h1', { timeout: 8000 });
+    } catch {}
+
+    // Scroll for lazy images
+    await page.evaluate(async () => {
+      for (let i = 0; i < 5; i++) {
+        window.scrollBy(0, 500);
+        await new Promise(r => setTimeout(r, 300));
+      }
+    });
+
+    // Check intercepted API data
+    if (apiData.length > 0) {
+      const p = apiData[0]?.product || apiData[0];
+      if (p?.title || p?.name) {
+        const imgs = extractImagesFromObject(p, getBase(url));
+        return {
+          title:       p.title || p.name,
+          price:       p.price || p.variants?.[0]?.price,
+          description: p.description || p.body_html,
+          images:      imgs,
+          image:       imgs[0] || null,
+          _platform:   `${options.platform}-playwright-intercepted`
+        };
+      }
+    }
+
+    // Extract from rendered DOM
+    const result = await page.evaluate((baseUrl) => {
+      const get  = (sel) => document.querySelector(sel)?.textContent?.trim() || '';
+      const getH = (sel) => document.querySelector(sel)?.innerHTML || '';
+      const getMeta = (prop) => document.querySelector(`meta[property="${prop}"], meta[name="${prop}"]`)?.content || '';
+
+      const title =
+        get('h1[class*="product"]') || get('[itemprop="name"]') ||
+        get('h1[class*="title"]')   || get('h1') || getMeta('og:title');
+
+      const price =
+        get('[itemprop="price"]') || get('[class*="sale-price"]') ||
+        get('[class*="product-price"]') || get('[class*="price"]:first-of-type') ||
+        document.querySelector('[itemprop="price"]')?.getAttribute('content') ||
+        getMeta('product:price:amount');
+
+      const description =
+        getH('[itemprop="description"]') || getH('[class*="description"]') ||
+        getMeta('og:description');
+
+      // Image extraction — all strategies
+      const images = [];
+      const seen   = new Set();
+
+      const addImg = (src) => {
+        if (!src || seen.has(src) || src.startsWith('data:')) return;
+        if (!src.startsWith('http') && !src.startsWith('//')) return;
+        const url = src.startsWith('//') ? 'https:' + src : src;
+        if (url.length > 15) { seen.add(src); images.push(url); }
+      };
+
+      // High quality attrs first
+      document.querySelectorAll('img').forEach(img => {
+        ['data-large_image','data-zoom-image','data-full-src','data-original',
+         'data-lazy-src','data-src','src'].forEach(attr => {
+          addImg(img.getAttribute(attr));
+        });
+        // srcset — get largest
+        const srcset = img.getAttribute('srcset') || img.getAttribute('data-srcset');
+        if (srcset) {
+          const parts = srcset.split(',').map(s => s.trim());
+          const last  = parts[parts.length - 1]?.split(/\s+/)[0];
+          if (last) addImg(last);
+        }
+      });
+
+      // OG image
+      addImg(getMeta('og:image'));
+
+      return { title, price, description, images: images.slice(0, 20) };
+    }, getBase(url));
+
+    result.image     = result.images?.[0] || null;
+    result._platform = `${options.platform}-playwright`;
+    return result;
+
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// UNIVERSAL FALLBACK (when platform-specific fails)
+// ═══════════════════════════════════════════════════════════
+async function scrapeFallback(url) {
+  try {
+    const res = await axios.get(url, { headers: getHeaders(), timeout: 20000 });
+    const $   = cheerio.load(res.data);
+    const base = getBase(url);
+
+    const ldResult = extractFromLdJson($, base);
+    if (ldResult?.title) return ldResult;
+
+    const winResult = extractFromWindowObjects(res.data, $, base);
+    if (winResult?.title) return winResult;
+
+    const nextResult = extractFromNextData($, base);
+    if (nextResult?.title) return nextResult;
+
+    return scrapeHTMLProduct($, base, url);
+  } catch {
+    return await scrapeWithPlaywright(url, { platform: 'fallback' });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// GENERIC HTML SCRAPER (Magento/BigCommerce HTML fallback)
+// ═══════════════════════════════════════════════════════════
+async function scrapeHTMLGeneric(url, platform) {
+  const res  = await axios.get(url, { headers: getHeaders(), timeout: 18000 });
+  const $    = cheerio.load(res.data);
+  const base = getBase(url);
+
+  const ldResult = extractFromLdJson($, base);
+  if (ldResult?.title) return { ...ldResult, _platform: `${platform}-ld-json` };
+
+  const result = scrapeHTMLProduct($, base, url);
+  result._platform = `${platform}-html`;
+  return result;
+}
+
+// ═══════════════════════════════════════════════════════════
+// NORMALIZER — Final clean output
+// ═══════════════════════════════════════════════════════════
+function normalize(raw, url, platform) {
+  if (!raw) return { status: 'error', url, message: 'No data extracted' };
+
+  const markup = parseFloat(process.env.DEFAULT_MARKUP || process.env.MARKUP_PERCENTAGE || 0);
+  const price  = parsePrice(raw.price);
+  const finalPrice = price && markup ? +(price * (1 + markup / 100)).toFixed(2) : price;
+
+  // Ensure images is always valid array
+  let images = raw.images || [];
+  if (!Array.isArray(images)) images = [images].filter(Boolean);
+  images = images.filter(u => u && typeof u === 'string' && u.startsWith('http'));
+
+  // Primary image — never empty if images exist
+  const image = raw.image && raw.image.startsWith('http') ? raw.image :
+                images[0] || null;
+
+  return {
+    title:            cleanText(raw.title || ''),
+    price:            finalPrice ? String(finalPrice) : cleanText(raw.price || ''),
+    compare_at_price: raw.compare_at_price || raw.compareAtPrice || null,
+    description:      raw.description || '',
+    image,
+    images,
+    variants:         raw.variants || [],
+    sku:              cleanText(raw.sku || ''),
+    vendor:           cleanText(raw.vendor || raw.brand || ''),
+    product_type:     raw.product_type || '',
+    url,
+    _platform:        raw._platform || platform,
+    _scrapedAt:       new Date().toISOString()
+  };
+}
+
+// ─── Helpers ─────────────────────────────────────────────
+function getBase(url) {
+  try { const u = new URL(url); return `${u.protocol}//${u.hostname}`; } catch { return ''; }
+}
+
+function getSlug(url) {
+  try {
+    const parts = new URL(url).pathname.split('/').filter(Boolean);
+    return parts[parts.length - 1].split('.')[0];
+  } catch { return ''; }
+}
+
+function parsePrice(val) {
+  if (!val) return null;
+  const n = parseFloat(String(val).replace(/[^0-9.]/g, ''));
+  return isNaN(n) ? null : n;
+}
+
+function cleanText(t) {
+  return String(t || '').replace(/\s+/g, ' ').trim();
+}
+
+function flattenImages(img, base) {
+  if (!img) return [];
+  const arr = Array.isArray(img) ? img : [img];
+  return arr.map(i => {
+    const src = typeof i === 'string' ? i : (i?.url || i?.src || i?.contentUrl);
+    return src ? makeAbsolute(src, base) : null;
+  }).filter(Boolean);
+}
+
+function extractImagesFromObject(p, base) {
+  const imgs = [];
+  if (p.image)  flattenImages(p.image, base).forEach(i => imgs.push(i));
+  if (p.images) (Array.isArray(p.images) ? p.images : [p.images]).forEach(i => {
+    const src = typeof i === 'string' ? i : (i?.src || i?.url || i?.originalSrc);
+    if (src) imgs.push(makeAbsolute(src, base));
+  });
+  if (p.featured_image) imgs.push(makeAbsolute(
+    typeof p.featured_image === 'string' ? p.featured_image : p.featured_image?.src, base
+  ));
+  return [...new Set(imgs)].filter(u => u && u.startsWith('http'));
+}
+
+function findProductInObject(obj, depth = 0) {
+  if (depth > 4 || !obj || typeof obj !== 'object') return null;
+  if ((obj.title || obj.name) && (obj.price || obj.images || obj.variants)) return obj;
+  for (const val of Object.values(obj)) {
+    const found = findProductInObject(val, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+module.exports = { scrapeUniversal };
