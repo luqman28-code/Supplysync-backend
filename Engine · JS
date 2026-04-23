@@ -1,0 +1,88 @@
+/**
+ * engine.js — Master Scraping Engine v2
+ * Uses universalScraper for ALL platforms automatically
+ */
+
+const { scrapeUniversal }            = require('./universalScraper');
+const { scrapeCollectionUniversal }  = require('./universalCollectionScraper');
+const { sleep }                      = require('./utils');
+
+/**
+ * Scrape a single product from ANY URL
+ */
+async function scrapeProduct(url, options = {}) {
+  try {
+    const result = await scrapeUniversal(url);
+
+    if (!result || !result.title) {
+      return { status: 'error', url, message: 'Could not extract product data' };
+    }
+
+    // Apply markup if passed in options
+    if (options.markup && options.markup > 0) {
+      const price = parseFloat(result.price);
+      if (!isNaN(price)) {
+        result.price = (price * (1 + options.markup / 100)).toFixed(2);
+      }
+    }
+
+    return { status: 'success', product: result };
+  } catch (err) {
+    console.error(`❌ [Engine] Error: ${err.message}`);
+    return { status: 'error', url, message: err.message };
+  }
+}
+
+/**
+ * Scrape multiple products — with concurrency control
+ */
+async function scrapeMany(urls, options = {}) {
+  const concurrency = options.concurrency || 5;
+  const results     = [];
+
+  for (let i = 0; i < urls.length; i += concurrency) {
+    const batch = urls.slice(i, i + concurrency);
+    console.log(`📦 [Engine] Batch ${Math.floor(i / concurrency) + 1}: ${batch.length} URLs`);
+
+    const batchResults = await Promise.allSettled(
+      batch.map(url => scrapeProduct(url, options))
+    );
+
+    batchResults.forEach((res, idx) => {
+      if (res.status === 'fulfilled') results.push(res.value);
+      else results.push({ status: 'error', url: batch[idx], message: res.reason?.message });
+    });
+
+    if (i + concurrency < urls.length) await sleep(1500);
+  }
+
+  const successful = results.filter(r => r.status === 'success');
+  const failed     = results.filter(r => r.status === 'error');
+
+  return {
+    status:         'success',
+    totalRequested: urls.length,
+    totalSuccess:   successful.length,
+    totalFailed:    failed.length,
+    products:       successful.map(r => r.product),
+    errors:         failed
+  };
+}
+
+/**
+ * Scrape entire collection then all products
+ */
+async function scrapeCollectionFull(collectionUrl, options = {}) {
+  console.log(`\n🚀 [Engine] Full collection scrape: ${collectionUrl}`);
+
+  const urls = await scrapeCollectionUniversal(collectionUrl, { maxPages: options.maxPages || 30 });
+  console.log(`📋 Found ${urls.length} product URLs`);
+
+  if (urls.length === 0) {
+    return { status: 'error', message: 'No product URLs found in collection' };
+  }
+
+  return await scrapeMany(urls, options);
+}
+
+module.exports = { scrapeProduct, scrapeMany, scrapeCollectionFull };
