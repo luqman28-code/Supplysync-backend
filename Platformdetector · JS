@@ -1,0 +1,138 @@
+/**
+ * platformDetector.js — Universal Platform Auto-Detection
+ * Detects: Shopify, WooCommerce, Magento, BigCommerce, Wix, Squarespace, Custom
+ */
+
+const axios   = require('axios');
+const cheerio = require('cheerio');
+const { getHeaders } = require('./utils');
+
+// ─── Known domains (fast path) ───────────────────────────────
+const KNOWN_PLATFORMS = {
+  shopify: [
+    'finnmarksauna.com','thermalux.uk','lumitherapy.co.uk',
+    'artisanfurniture.net','gardenhouse24.co.uk','gudrum.com',
+    'costway.com'
+  ],
+  woocommerce: [
+    'tuindeco.com','themiraclesauna.com','hottubsoxfordshire.co.uk',
+    'swimmingpool.eu','rotospa.co.uk','lisnawaters.co.uk',
+    'woodselections.com','tuin.co.uk','spapartsvortex.eu',
+    'saunamo.pt','polhus.co.uk','heatandplumb.com','schiedel.com'
+  ],
+  wix:        ['wix.com','wixsite.com'],
+  squarespace:['squarespace.com','sqsp.net'],
+  bigcommerce:['bigcommerce.com','mybigcommerce.com'],
+  magento:    ['magento.com']
+};
+
+/**
+ * Main detector — tries fast path first, then HTTP detection
+ * @param {string} url
+ * @returns {Promise<string>} platform name
+ */
+async function detectPlatform(url) {
+  // 1. Check known domains first (instant)
+  const domain = extractDomain(url);
+  for (const [platform, domains] of Object.entries(KNOWN_PLATFORMS)) {
+    if (domains.some(d => domain.includes(d))) return platform;
+  }
+
+  // 2. URL pattern hints
+  if (url.includes('myshopify.com'))     return 'shopify';
+  if (url.includes('/products/'))        return 'shopify';
+  if (url.includes('/collections/'))     return 'shopify';
+  if (url.includes('/product/'))         return 'woocommerce';
+  if (url.includes('wp-content'))        return 'woocommerce';
+  if (url.includes('wixsite.com'))       return 'wix';
+  if (url.includes('squarespace.com'))   return 'squarespace';
+
+  // 3. HTTP headers + HTML inspection
+  try {
+    const result = await detectFromHttp(url);
+    if (result) return result;
+  } catch (e) {
+    console.log(`  [Detector] HTTP detection failed: ${e.message}`);
+  }
+
+  return 'custom';
+}
+
+async function detectFromHttp(url) {
+  const res = await axios.get(url, {
+    headers:      getHeaders(),
+    timeout:      12000,
+    maxRedirects: 5,
+    validateStatus: s => s < 500
+  });
+
+  // Check response headers
+  const headers = res.headers;
+  const powered  = (headers['x-powered-by'] || '').toLowerCase();
+  const server   = (headers['server'] || '').toLowerCase();
+
+  if (powered.includes('wix'))         return 'wix';
+  if (server.includes('squarespace'))  return 'squarespace';
+
+  // Check HTML content
+  const html = res.data;
+  const $    = cheerio.load(html);
+
+  // Shopify signals
+  if (
+    html.includes('Shopify.theme') ||
+    html.includes('cdn.shopify.com') ||
+    html.includes('shopify-section') ||
+    $('meta[name="shopify-checkout-api-token"]').length
+  ) return 'shopify';
+
+  // WooCommerce signals
+  if (
+    html.includes('woocommerce') ||
+    html.includes('wp-content/plugins/woocommerce') ||
+    $('body.woocommerce').length ||
+    $('body.woocommerce-page').length
+  ) return 'woocommerce';
+
+  // Magento signals
+  if (
+    html.includes('Magento') ||
+    html.includes('mage/') ||
+    html.includes('"Mage"') ||
+    html.includes('magento')
+  ) return 'magento';
+
+  // BigCommerce signals
+  if (
+    html.includes('bigcommerce') ||
+    html.includes('cdn11.bigcommerce.com') ||
+    html.includes('BigCommerce')
+  ) return 'bigcommerce';
+
+  // Wix signals
+  if (
+    html.includes('wix.com') ||
+    html.includes('X-Wix-') ||
+    html.includes('wixstatic.com') ||
+    html.includes('_wixCssModules')
+  ) return 'wix';
+
+  // Squarespace signals
+  if (
+    html.includes('squarespace') ||
+    html.includes('sqsp.net') ||
+    $('meta[name="generator"][content*="Squarespace"]').length
+  ) return 'squarespace';
+
+  return null;
+}
+
+function extractDomain(url) {
+  try {
+    return new URL(url).hostname.replace('www.', '');
+  } catch {
+    return url;
+  }
+}
+
+module.exports = { detectPlatform, extractDomain };
