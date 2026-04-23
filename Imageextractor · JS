@@ -1,0 +1,263 @@
+/**
+ * imageExtractor.js — Universal Image Extractor
+ * Handles: src, data-src, srcset, lazy-load, og:image, JSON-LD
+ * Guarantees NO empty images in output
+ */
+
+const cheerio = require('cheerio');
+
+/**
+ * Extract all valid images from HTML
+ * @param {CheerioStatic} $ - Cheerio instance
+ * @param {string} baseUrl - for making relative URLs absolute
+ * @returns {string[]} Array of valid image URLs, highest quality first
+ */
+function extractImages($, baseUrl = '') {
+  const images = new Map(); // url -> score (higher = better quality)
+
+  // ── 1. JSON-LD Schema images ────────────────────────────────
+  $('script[type="application/ld+json"]').each((_, el) => {
+    try {
+      const data = JSON.parse($(el).html());
+      const schemas = Array.isArray(data) ? data : [data];
+      schemas.forEach(schema => {
+        const product = schema['@type'] === 'Product' ? schema :
+                        schema['@graph']?.find(g => g['@type'] === 'Product');
+        if (product?.image) {
+          flattenImageValue(product.image).forEach(src => {
+            const abs = makeAbsolute(src, baseUrl);
+            if (isValidImageUrl(abs)) images.set(abs, (images.get(abs) || 0) + 100);
+          });
+        }
+      });
+    } catch {}
+  });
+
+  // ── 2. OpenGraph images ─────────────────────────────────────
+  $('meta[property="og:image"], meta[property="og:image:secure_url"]').each((_, el) => {
+    const src = $(el).attr('content');
+    const abs = makeAbsolute(src, baseUrl);
+    if (isValidImageUrl(abs)) images.set(abs, (images.get(abs) || 0) + 90);
+  });
+
+  // ── 3. Twitter card images ──────────────────────────────────
+  $('meta[name="twitter:image"]').each((_, el) => {
+    const src = $(el).attr('content');
+    const abs = makeAbsolute(src, baseUrl);
+    if (isValidImageUrl(abs)) images.set(abs, (images.get(abs) || 0) + 80);
+  });
+
+  // ── 4. Product-specific img tags ───────────────────────────
+  const productSelectors = [
+    // Shopify
+    '.product__media img',
+    '.product-featured-img',
+    '[data-product-featured-image]',
+    '.product-single__photo img',
+    '.product__photo img',
+    // WooCommerce
+    '.woocommerce-product-gallery__image img',
+    '.wp-post-image',
+    'figure.woocommerce-product-gallery__wrapper img',
+    // Generic product
+    '[class*="product-image"] img',
+    '[class*="product-photo"] img',
+    '[class*="product-media"] img',
+    '[class*="product-gallery"] img',
+    '.gallery img',
+    '[id*="product-image"] img',
+    'figure img',
+    // High-res hints
+    'img[data-zoom-image]',
+    'img[data-large_image]',
+    'img[data-full-src]',
+    'img[data-high-res-src]',
+  ];
+
+  for (const selector of productSelectors) {
+    $(selector).each((_, el) => {
+      const score = 70;
+      extractAllSrcs($(el)).forEach(src => {
+        const abs = makeAbsolute(src, baseUrl);
+        if (isValidImageUrl(abs)) {
+          images.set(abs, Math.max(images.get(abs) || 0, score));
+        }
+      });
+    });
+  }
+
+  // ── 5. ALL img tags (broad fallback) ───────────────────────
+  $('img').each((_, el) => {
+    const $el   = $(el);
+    const srcs  = extractAllSrcs($el);
+    const alt   = ($el.attr('alt') || '').toLowerCase();
+    const cls   = ($el.attr('class') || '').toLowerCase();
+    const id    = ($el.attr('id')    || '').toLowerCase();
+
+    // Score based on context
+    let score = 10;
+    if (alt.includes('product'))   score += 30;
+    if (cls.includes('product'))   score += 25;
+    if (id.includes('product'))    score += 25;
+    if (cls.includes('gallery'))   score += 20;
+    if (cls.includes('main'))      score += 15;
+    if (cls.includes('feature'))   score += 15;
+
+    // Downgrade if clearly not product
+    if (cls.includes('logo'))      score -= 50;
+    if (cls.includes('icon'))      score -= 50;
+    if (cls.includes('avatar'))    score -= 40;
+    if (cls.includes('thumbnail') && score < 30) score -= 20;
+
+    srcs.forEach(src => {
+      const abs = makeAbsolute(src, baseUrl);
+      if (isValidImageUrl(abs)) {
+        images.set(abs, Math.max(images.get(abs) || 0, score));
+      }
+    });
+  });
+
+  // ── 6. Background images from style ────────────────────────
+  $('[style*="background-image"]').each((_, el) => {
+    const style = $(el).attr('style') || '';
+    const match = style.match(/url\(['"]?([^'")\s]+)['"]?\)/);
+    if (match) {
+      const abs = makeAbsolute(match[1], baseUrl);
+      if (isValidImageUrl(abs)) images.set(abs, (images.get(abs) || 0) + 20);
+    }
+  });
+
+  // Sort by score, return top quality images only
+  return [...images.entries()]
+    .filter(([_, score]) => score > 0)
+    .sort(([, a], [, b]) => b - a)
+    .map(([url]) => preferHighRes(url))
+    .filter((url, idx, arr) => arr.indexOf(url) === idx) // dedupe
+    .slice(0, 20);
+}
+
+/**
+ * Extract all possible src values from a single img element
+ * Handles: src, data-src, data-lazy-src, srcset, data-srcset, etc.
+ */
+function extractAllSrcs($el) {
+  const srcs = [];
+
+  // Direct attributes
+  const attrs = [
+    'data-large_image',
+    'data-zoom-image',
+    'data-full-src',
+    'data-high-res-src',
+    'data-original',
+    'data-original-src',
+    'data-lazy-src',
+    'data-lazy',
+    'data-src',
+    'data-delayed-src',
+    'data-echo',
+    'data-bg',
+    'src'
+  ];
+
+  for (const attr of attrs) {
+    const val = $el.attr(attr);
+    if (val && !val.startsWith('data:') && val !== '#' && val.length > 10) {
+      srcs.push(val);
+    }
+  }
+
+  // srcset — pick highest resolution
+  const srcset = $el.attr('srcset') || $el.attr('data-srcset');
+  if (srcset) {
+    const best = parseSrcset(srcset);
+    if (best) srcs.unshift(best); // Highest quality first
+  }
+
+  return srcs;
+}
+
+/**
+ * Parse srcset string and return the highest resolution URL
+ */
+function parseSrcset(srcset) {
+  try {
+    const parts = srcset.split(',').map(s => s.trim()).filter(Boolean);
+    let bestUrl  = null;
+    let bestW    = 0;
+
+    for (const part of parts) {
+      const tokens = part.split(/\s+/).filter(Boolean);
+      const url    = tokens[0];
+      const desc   = tokens[1] || '';
+      const w      = desc.endsWith('w') ? parseInt(desc) :
+                     desc.endsWith('x') ? parseFloat(desc) * 1000 : 0;
+
+      if (w > bestW && url && !url.startsWith('data:')) {
+        bestW   = w;
+        bestUrl = url;
+      }
+    }
+
+    return bestUrl || (parts[0]?.split(/\s+/)[0]);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Try to get highest res version of a URL
+ * e.g. _small → _large, 200x200 → 1200x1200
+ */
+function preferHighRes(url) {
+  if (!url) return url;
+  return url
+    .replace(/_small(\.\w+)/, '_1200x$1')
+    .replace(/_medium(\.\w+)/, '_1200x$1')
+    .replace(/_compact(\.\w+)/, '_1200x$1')
+    .replace(/[?&]w=\d+/, '?w=1200')
+    .replace(/\/\d{2,4}x\d{2,4}\//, '/1200x1200/')
+    .replace(/\?fit=\d+,\d+/, '?fit=1200,1200');
+}
+
+/**
+ * Validate image URL — must be real image link
+ */
+function isValidImageUrl(url) {
+  if (!url || typeof url !== 'string') return false;
+  if (!url.startsWith('http'))          return false;
+  if (url.startsWith('data:'))          return false;
+  if (url.length < 15)                  return false;
+
+  // Must look like an image (has image extension or CDN pattern)
+  const lower = url.toLowerCase();
+  const hasExt = /\.(jpg|jpeg|png|webp|gif|avif|svg)(\?|$|#)/.test(lower);
+  const isCdn  = lower.includes('cdn') || lower.includes('images') ||
+                 lower.includes('static') || lower.includes('media') ||
+                 lower.includes('upload') || lower.includes('asset');
+
+  return hasExt || isCdn;
+}
+
+function flattenImageValue(img) {
+  if (!img) return [];
+  if (typeof img === 'string') return [img];
+  if (Array.isArray(img)) return img.flatMap(i => typeof i === 'string' ? [i] : [i?.url, i?.src].filter(Boolean));
+  return [img.url, img.src, img.contentUrl].filter(Boolean);
+}
+
+function makeAbsolute(src, base) {
+  if (!src) return '';
+  src = src.trim();
+  if (src.startsWith('http')) return src;
+  if (src.startsWith('//'))   return 'https:' + src;
+  if (src.startsWith('/') && base) {
+    try {
+      const u = new URL(base);
+      return `${u.protocol}//${u.hostname}${src}`;
+    } catch {}
+  }
+  return src;
+}
+
+module.exports = { extractImages, extractAllSrcs, isValidImageUrl, makeAbsolute, parseSrcset };
