@@ -1,0 +1,323 @@
+/**
+ * universalCollectionScraper.js — Bulk Product URL Extractor
+ * Works on: Shopify collections, WooCommerce categories, Wix, Squarespace, Custom
+ */
+
+const axios   = require('axios');
+const cheerio = require('cheerio');
+const { detectPlatform } = require('./platformDetector');
+const { getHeaders, sleep } = require('./utils');
+
+/**
+ * Main entry — get ALL product URLs from any collection/category page
+ */
+async function scrapeCollectionUniversal(collectionUrl, opts = {}) {
+  const maxPages = opts.maxPages || 50;
+  const platform = await detectPlatform(collectionUrl);
+
+  console.log(`📂 [Collection] ${collectionUrl.slice(0, 60)} → Platform: ${platform}`);
+
+  switch (platform) {
+    case 'shopify':     return await shopifyCollection(collectionUrl, maxPages);
+    case 'woocommerce': return await wooCollection(collectionUrl, maxPages);
+    case 'bigcommerce': return await bigCommerceCollection(collectionUrl, maxPages);
+    case 'wix':         return await wixCollection(collectionUrl, maxPages);
+    default:            return await genericCollection(collectionUrl, maxPages);
+  }
+}
+
+// ─── SHOPIFY ─────────────────────────────────────────────
+async function shopifyCollection(url, maxPages) {
+  const base   = getBase(url);
+  const handle = url.match(/\/collections\/([^\/\?#]+)/)?.[1];
+  if (!handle) return await genericCollection(url, maxPages);
+
+  const links = [];
+  let   page  = 1;
+
+  while (page <= maxPages) {
+    const apiUrl = `${base}/collections/${handle}/products.json?limit=250&page=${page}`;
+    try {
+      const res  = await axios.get(apiUrl, { headers: getHeaders(), timeout: 15000 });
+      const prods = res.data?.products || [];
+      if (prods.length === 0) break;
+
+      prods.forEach(p => links.push(`${base}/products/${p.handle}`));
+      console.log(`  Shopify page ${page}: +${prods.length} (total: ${links.length})`);
+
+      if (prods.length < 250) break;
+      page++;
+      await sleep(700);
+    } catch { break; }
+  }
+
+  return [...new Set(links)];
+}
+
+// ─── WOOCOMMERCE ─────────────────────────────────────────
+async function wooCollection(url, maxPages) {
+  const base  = getBase(url);
+  const links = [];
+  let   page  = 1;
+  let   currentUrl = url;
+
+  while (page <= maxPages) {
+    try {
+      const res = await axios.get(currentUrl, { headers: getHeaders(), timeout: 18000 });
+      const $   = cheerio.load(res.data);
+
+      const pageLinks = [];
+      // WooCommerce product link selectors
+      $([
+        'a.woocommerce-loop-product__link',
+        '.products .product a:first-child',
+        'li.product a[href*="/product/"]',
+        '.wc-block-grid__product-link',
+        '[class*="wc-block"] a[href*="product"]'
+      ].join(',')).each((_, el) => {
+        const href = makeAbsolute($(el).attr('href'), base);
+        if (href && !pageLinks.includes(href)) pageLinks.push(href);
+      });
+
+      if (pageLinks.length === 0) break;
+      pageLinks.forEach(l => { if (!links.includes(l)) links.push(l); });
+      console.log(`  WooCommerce page ${page}: +${pageLinks.length} (total: ${links.length})`);
+
+      // Next page
+      const nextHref = $('a.next, [rel="next"], .pagination a:contains("Next"), .nav-next a').attr('href');
+      if (!nextHref) break;
+      currentUrl = makeAbsolute(nextHref, base);
+      page++;
+      await sleep(1000);
+    } catch { break; }
+  }
+
+  return [...new Set(links)];
+}
+
+// ─── BIGCOMMERCE ─────────────────────────────────────────
+async function bigCommerceCollection(url, maxPages) {
+  const base  = getBase(url);
+  const links = [];
+  let   page  = 1;
+
+  while (page <= maxPages) {
+    const pageUrl = page === 1 ? url : `${url}?page=${page}`;
+    try {
+      const res = await axios.get(pageUrl, { headers: getHeaders(), timeout: 15000 });
+      const $   = cheerio.load(res.data);
+      const pageLinks = [];
+
+      $('a[href*="/products/"],.product-item a,.productGrid a').each((_, el) => {
+        const href = makeAbsolute($(el).attr('href'), base);
+        if (href && href.includes('/products/')) pageLinks.push(href);
+      });
+
+      if (pageLinks.length === 0) break;
+      pageLinks.forEach(l => { if (!links.includes(l)) links.push(l); });
+
+      const hasNext = $('[data-page-next], a[rel="next"]').length > 0;
+      if (!hasNext) break;
+      page++;
+      await sleep(800);
+    } catch { break; }
+  }
+
+  return [...new Set(links)];
+}
+
+// ─── WIX (needs Playwright) ───────────────────────────────
+async function wixCollection(url, maxPages) {
+  // Try HTML first
+  try {
+    const res = await axios.get(url, { headers: getHeaders(), timeout: 20000 });
+    const $   = cheerio.load(res.data);
+    const base = getBase(url);
+    const links = [];
+
+    $('a[href*="/product/"], a[data-hook="product-item-container"] a').each((_, el) => {
+      const href = makeAbsolute($(el).attr('href'), base);
+      if (href) links.push(href);
+    });
+
+    if (links.length > 0) return [...new Set(links)];
+  } catch {}
+
+  // Playwright fallback for Wix
+  return await playwrightCollection(url, maxPages);
+}
+
+// ─── GENERIC (any custom site) ────────────────────────────
+async function genericCollection(url, maxPages) {
+  const base  = getBase(url);
+  const links = [];
+  let   currentUrl = url;
+  let   page  = 1;
+
+  while (page <= maxPages) {
+    try {
+      const res = await axios.get(currentUrl, { headers: getHeaders(), timeout: 20000, maxRedirects: 5 });
+      const $   = cheerio.load(res.data);
+      const pageLinks = extractProductLinksFromPage($, url, base);
+
+      if (pageLinks.length === 0) break;
+      pageLinks.forEach(l => { if (!links.includes(l)) links.push(l); });
+      console.log(`  Generic page ${page}: +${pageLinks.length} (total: ${links.length})`);
+
+      const nextUrl = findNextPageUrl($, currentUrl, page, base);
+      if (!nextUrl || nextUrl === currentUrl) break;
+      currentUrl = nextUrl;
+      page++;
+      await sleep(1200);
+    } catch (e) {
+      console.log(`  ❌ Page ${page}: ${e.message}`);
+      break;
+    }
+  }
+
+  // If nothing found, try Playwright
+  if (links.length === 0) {
+    console.log('  Trying Playwright for collection...');
+    return await playwrightCollection(url, 1);
+  }
+
+  return [...new Set(links)];
+}
+
+function extractProductLinksFromPage($, pageUrl, base) {
+  const links = new Set();
+
+  // Selectors in priority order
+  const selectors = [
+    'a[href*="/product/"]',
+    'a[href*="/products/"]',
+    'a[href*="/p/"]',
+    'a[href*="/item/"]',
+    'a[href*="/shop/"]',
+    '.product a[href]',
+    '.product-item a[href]',
+    '.product-card a[href]',
+    'article a[href]',
+    '[class*="product"] a[href]',
+    '[class*="item-card"] a[href]',
+  ];
+
+  for (const sel of selectors) {
+    $(sel).each((_, el) => {
+      const href = makeAbsolute($(el).attr('href'), base);
+      if (href && isProductUrl(href, pageUrl)) links.add(href);
+    });
+    if (links.size >= 5) break; // Found good selector, stop
+  }
+
+  // If nothing specific found, grab all plausible internal product links
+  if (links.size === 0) {
+    $('a[href]').each((_, el) => {
+      const href = makeAbsolute($(el).attr('href'), base);
+      if (href && isProductUrl(href, pageUrl) && !isCategoryUrl(href)) {
+        links.add(href);
+      }
+    });
+  }
+
+  return [...links];
+}
+
+function isProductUrl(href, pageUrl) {
+  if (!href?.startsWith('http')) return false;
+  if (href === pageUrl) return false;
+
+  // Must be same domain
+  try {
+    const base = new URL(pageUrl).hostname;
+    if (new URL(href).hostname !== base) return false;
+  } catch { return false; }
+
+  const path = new URL(href).pathname;
+  const productPatterns = ['/product/', '/products/', '/p/', '/item/', '/shop/', '/store/'];
+  if (productPatterns.some(p => path.includes(p))) return true;
+
+  // Generic: path has 2+ segments and doesn't look like a category
+  const parts = path.split('/').filter(Boolean);
+  return parts.length >= 2 && !isCategoryUrl(href);
+}
+
+function isCategoryUrl(href) {
+  return /\/(category|categories|collection|collections|cat|c|tag|tags|brand|brands|shop|department)\//i.test(href);
+}
+
+function findNextPageUrl($, currentUrl, currentPage, base) {
+  // rel="next"
+  const relNext = $('a[rel="next"]').attr('href');
+  if (relNext) return makeAbsolute(relNext, base);
+
+  // Common next page selectors
+  const nextSelectors = [
+    'a.next', 'a.next-page', '.pagination__next a',
+    'nav.pagination a:last-child', '.pagination a[aria-label="Next"]',
+    `a[href*="page=${currentPage + 1}"]`,
+    `a[href*="/page/${currentPage + 1}/"]`,
+    `a[href*="?p=${currentPage + 1}"]`,
+    `.woocommerce-pagination a.next`
+  ];
+
+  for (const sel of nextSelectors) {
+    const href = $(sel).first().attr('href');
+    if (href) return makeAbsolute(href, base);
+  }
+
+  return null;
+}
+
+// ─── PLAYWRIGHT for JS-heavy collections ──────────────────
+async function playwrightCollection(url, maxPages) {
+  let pw, browser;
+  try { pw = require('playwright'); } catch { return []; }
+
+  const links = [];
+  try {
+    browser = await pw.chromium.launch({ headless: true, args: ['--no-sandbox','--disable-setuid-sandbox'] });
+    const ctx  = await browser.newContext({ userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36' });
+    const page = await ctx.newPage();
+    const base = getBase(url);
+
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 35000 });
+    await page.waitForTimeout(3000);
+
+    // Scroll to load all products
+    await page.evaluate(async () => {
+      for (let i = 0; i < 10; i++) {
+        window.scrollBy(0, 600);
+        await new Promise(r => setTimeout(r, 400));
+      }
+    });
+
+    const hrefs = await page.evaluate(() => {
+      return [...document.querySelectorAll('a[href]')]
+        .map(a => a.href)
+        .filter(h => h.includes('/product') || h.includes('/item') || h.includes('/p/'));
+    });
+
+    hrefs.forEach(h => {
+      if (h.startsWith('http') && !links.includes(h)) links.push(h);
+    });
+  } catch {}
+  finally { if (browser) await browser.close().catch(() => {}); }
+
+  return [...new Set(links)];
+}
+
+function getBase(url) {
+  try { const u = new URL(url); return `${u.protocol}//${u.hostname}`; } catch { return ''; }
+}
+
+function makeAbsolute(href, base) {
+  if (!href) return '';
+  href = href.trim();
+  if (href.startsWith('http')) return href;
+  if (href.startsWith('//'))   return 'https:' + href;
+  if (href.startsWith('/'))    return base + href;
+  return base + '/' + href;
+}
+
+module.exports = { scrapeCollectionUniversal };
